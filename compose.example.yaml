@@ -1,0 +1,60 @@
+name: perkos-nayori-oauth
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nayori_oauth
+      POSTGRES_PASSWORD: nayori-local-only
+      POSTGRES_USER: nayori_oauth
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nayori_oauth -d nayori_oauth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - backend
+
+  oauth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      API_ORIGIN: https://api.nayori.ai
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      DATABASE_SSL: disable
+      DATABASE_URL: postgresql://nayori_oauth:nayori-local-only@postgres:5432/nayori_oauth
+      ISSUER_ORIGIN: http://localhost:8080
+      NODE_ENV: development
+      PARTNER_REGISTRATION_ENABLED: "false"
+      RELEASE_SHA: local-compose
+      RESOURCE_ORIGIN: https://nayori.ai
+      STACKS_NETWORK: testnet
+    env_file:
+      - .env
+    command: ["sh", "-c", "node dist/migrate.js && exec node dist/server.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  backend:
+    internal: true
+
+volumes:
+  postgres-data:
