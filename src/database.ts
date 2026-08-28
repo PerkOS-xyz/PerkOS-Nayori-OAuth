@@ -4,6 +4,7 @@ import type {
   OAuthClientRecord,
   OAuthScope,
   OAuthStore,
+  AgentRegistrationRecord,
   PartnerInvitationRecord,
   WalletAuthChallengeRecord
 } from "./store.js";
@@ -125,6 +126,117 @@ export class PostgresOAuthStore implements OAuthStore {
     await this.#pool.query(
       "UPDATE oauth_clients SET last_token_at = $2 WHERE client_id = $1 AND status = 'active'",
       [clientId, issuedAt]
+    );
+  }
+
+  async insertAgentRegistration(input: AgentRegistrationRecord & {
+    readonly claimTokenDigest: string;
+    readonly userCodeDigest: string;
+  }): Promise<void> {
+    await this.#pool.query(
+      `INSERT INTO agent_registrations
+       (registration_id, label, challenge_id, claim_token_digest, user_code_digest, claim_expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [input.registrationId, input.label, input.challengeId, input.claimTokenDigest,
+        input.userCodeDigest, input.claimExpiresAt]
+    );
+  }
+
+  async findAgentRegistration(registrationId: string): Promise<AgentRegistrationRecord | null> {
+    const result = await this.#pool.query(
+      `SELECT registration_id AS "registrationId", label, challenge_id AS "challengeId",
+              claim_expires_at AS "claimExpiresAt", claimed_at AS "claimedAt",
+              wallet_address AS "walletAddress", public_key AS "publicKey",
+              revoked_at AS "revokedAt", last_polled_at AS "lastPolledAt"
+       FROM agent_registrations WHERE registration_id = $1 LIMIT 1`,
+      [registrationId]
+    );
+    return (result.rows[0] as AgentRegistrationRecord | undefined) ?? null;
+  }
+
+  async findAgentRegistrationForClaim(input: {
+    readonly claimTokenDigest: string;
+    readonly userCodeDigest: string;
+    readonly now: Date;
+  }): Promise<AgentRegistrationRecord | null> {
+    const result = await this.#pool.query(
+      `SELECT registration_id AS "registrationId", label, challenge_id AS "challengeId",
+              claim_expires_at AS "claimExpiresAt", claimed_at AS "claimedAt",
+              wallet_address AS "walletAddress", public_key AS "publicKey",
+              revoked_at AS "revokedAt", last_polled_at AS "lastPolledAt"
+       FROM agent_registrations
+       WHERE claim_token_digest = $1 AND user_code_digest = $2 AND claim_expires_at >= $3
+         AND revoked_at IS NULL LIMIT 1`,
+      [input.claimTokenDigest, input.userCodeDigest, input.now]
+    );
+    return (result.rows[0] as AgentRegistrationRecord | undefined) ?? null;
+  }
+
+  async claimAgentRegistration(input: {
+    readonly challengeId: string;
+    readonly walletAddress: string;
+    readonly publicKey: string;
+    readonly claimedAt: Date;
+  }): Promise<AgentRegistrationRecord | null> {
+    const result = await this.#pool.query(
+      `UPDATE agent_registrations
+       SET claimed_at = $2, wallet_address = $3, public_key = $4
+       WHERE challenge_id = $1 AND claimed_at IS NULL AND revoked_at IS NULL
+         AND claim_expires_at >= $2
+       RETURNING registration_id AS "registrationId", label, challenge_id AS "challengeId",
+                 claim_expires_at AS "claimExpiresAt", claimed_at AS "claimedAt",
+                 wallet_address AS "walletAddress", public_key AS "publicKey",
+                 revoked_at AS "revokedAt", last_polled_at AS "lastPolledAt"`,
+      [input.challengeId, input.claimedAt, input.walletAddress, input.publicKey]
+    );
+    return (result.rows[0] as AgentRegistrationRecord | undefined) ?? null;
+  }
+
+  async pollAgentClaim(input: {
+    readonly claimTokenDigest: string;
+    readonly now: Date;
+    readonly minimumIntervalSeconds: number;
+  }): Promise<{ readonly status: "pending" | "claimed" | "expired" | "slow_down";
+    readonly registration: AgentRegistrationRecord | null }> {
+    const connection = await this.#pool.connect();
+    try {
+      await connection.query("BEGIN");
+      const result = await connection.query<AgentRegistrationRecord>(
+        `SELECT registration_id AS "registrationId", label, challenge_id AS "challengeId",
+                claim_expires_at AS "claimExpiresAt", claimed_at AS "claimedAt",
+                wallet_address AS "walletAddress", public_key AS "publicKey",
+                revoked_at AS "revokedAt", last_polled_at AS "lastPolledAt"
+         FROM agent_registrations WHERE claim_token_digest = $1 AND revoked_at IS NULL
+         FOR UPDATE`,
+        [input.claimTokenDigest]
+      );
+      const registration = result.rows[0] ?? null;
+      if (!registration || registration.claimExpiresAt < input.now) {
+        await connection.query("ROLLBACK");
+        return { status: "expired", registration };
+      }
+      if (registration.lastPolledAt &&
+          input.now.getTime() - registration.lastPolledAt.getTime() < input.minimumIntervalSeconds * 1_000) {
+        await connection.query("ROLLBACK");
+        return { status: "slow_down", registration };
+      }
+      await connection.query(
+        "UPDATE agent_registrations SET last_polled_at = $2 WHERE registration_id = $1",
+        [registration.registrationId, input.now]
+      );
+      await connection.query("COMMIT");
+      return { status: registration.claimedAt ? "claimed" : "pending",
+        registration: { ...registration, lastPolledAt: input.now } };
+    } catch (error) {
+      await connection.query("ROLLBACK");
+      throw error;
+    } finally { connection.release(); }
+  }
+
+  async recordAgentAccessTokenIssued(registrationId: string, issuedAt: Date): Promise<void> {
+    await this.#pool.query(
+      "UPDATE agent_registrations SET last_token_at = $2 WHERE registration_id = $1 AND revoked_at IS NULL",
+      [registrationId, issuedAt]
     );
   }
 }

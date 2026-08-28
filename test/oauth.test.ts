@@ -1,8 +1,10 @@
 import { hashMessage } from "@stacks/encryption";
-import { privateKeyToPublic, publicKeyToAddressSingleSig, randomPrivateKey, signMessageHashRsv } from "@stacks/transactions";
+import { privateKeyToPublic, publicKeyToAddressSingleSig, randomPrivateKey, signMessageHashRsv,
+  signStructuredData } from "@stacks/transactions";
 import { createLocalJWKSet, jwtVerify } from "jose";
 import { describe, expect, it } from "vitest";
-import { createInvitationRecord, createOAuthService, createOAuthSigner, hashPartnerInvitationToken } from "../src/oauth.js";
+import { buildAgentClaimClarity, createInvitationRecord, createOAuthService, createOAuthSigner,
+  hashPartnerInvitationToken } from "../src/oauth.js";
 import type { OAuthScope } from "../src/store.js";
 import { MemoryStore, testConfig } from "./helpers.js";
 
@@ -81,5 +83,91 @@ describe("wallet-linked partner OAuth", () => {
     await expect(service.issueToken(`Basic ${basic}`,
       new URLSearchParams({ grant_type: "client_credentials", scope: "payments:settle" })))
       .rejects.toMatchObject({ code: "invalid_scope" });
+  });
+});
+
+describe("anonymous agent registration and wallet claim", () => {
+  it("keeps agent:self before and after an atomic SIP-018 wallet claim", async () => {
+    let currentTime = NOW;
+    const config = await testConfig();
+    const signer = await createOAuthSigner(config);
+    const store = new MemoryStore();
+    const service = createOAuthService({ config, store, signer, now: () => currentTime });
+
+    const identity = await service.createAgentIdentity({ type: "anonymous", label: "Research agent" });
+    expect(identity).toMatchObject({ pre_claim_scopes: ["agent:self"],
+      post_claim_scopes: ["agent:self"], interval: 5 });
+    expect(identity.claim_url).toBe(`https://nayori.ai/agents/claim#${identity.claim_token}`);
+
+    const anonymousToken = await service.issueToken(undefined, new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: identity.identity_assertion
+    }));
+    const anonymousSelf = await service.getAgentSelf(`Bearer ${anonymousToken.access_token}`);
+    expect(anonymousSelf).toEqual({ registration_id: identity.registration_id, label: "Research agent",
+      claimed: false, wallet_address: null, scopes: ["agent:self"] });
+
+    const prepared = await service.prepareAgentClaim({ claim_token: identity.claim_token,
+      user_code: identity.user_code });
+    const privateKey = randomPrivateKey();
+    const publicKey = privateKeyToPublic(privateKey);
+    const publicKeyHex = typeof publicKey === "string" ? publicKey : Buffer.from(publicKey).toString("hex");
+    const walletAddress = publicKeyToAddressSingleSig(publicKey, "testnet");
+    const signature = signStructuredData({ ...buildAgentClaimClarity(prepared.claim), privateKey });
+    const claimed = await service.completeAgentClaim({ claim_token: identity.claim_token,
+      user_code: identity.user_code, challenge_id: prepared.claim.challengeId,
+      wallet_address: walletAddress, public_key: publicKeyHex, signature });
+    expect(claimed).toEqual({ status: "claimed", registration_id: identity.registration_id,
+      wallet_address: walletAddress, scopes: ["agent:self"] });
+
+    currentTime += 6_000;
+    const claimedToken = await service.issueToken(undefined, new URLSearchParams({
+      grant_type: "urn:workos:agent-auth:grant-type:claim", claim_token: identity.claim_token
+    }));
+    const claimedSelf = await service.getAgentSelf(`Bearer ${claimedToken.access_token}`);
+    expect(claimedToken.scope).toBe("agent:self");
+    expect(claimedToken.identity_assertion).toBeTypeOf("string");
+    expect(claimedSelf).toMatchObject({ claimed: true, wallet_address: walletAddress,
+      scopes: ["agent:self"] });
+  });
+
+  it("rejects a wrong code, wallet mismatch, claim replay and fast polling", async () => {
+    let currentTime = NOW;
+    const config = await testConfig();
+    const signer = await createOAuthSigner(config);
+    const store = new MemoryStore();
+    const service = createOAuthService({ config, store, signer, now: () => currentTime });
+    const identity = await service.createAgentIdentity({ type: "anonymous" });
+
+    await expect(service.prepareAgentClaim({ claim_token: identity.claim_token, user_code: "AAAA-BBBB" }))
+      .rejects.toMatchObject({ code: "invalid_grant" });
+    await expect(service.issueToken(undefined, new URLSearchParams({
+      grant_type: "urn:workos:agent-auth:grant-type:claim", claim_token: identity.claim_token
+    }))).rejects.toMatchObject({ code: "authorization_pending" });
+    currentTime += 1_000;
+    await expect(service.issueToken(undefined, new URLSearchParams({
+      grant_type: "urn:workos:agent-auth:grant-type:claim", claim_token: identity.claim_token
+    }))).rejects.toMatchObject({ code: "slow_down" });
+
+    const prepared = await service.prepareAgentClaim({ claim_token: identity.claim_token,
+      user_code: identity.user_code });
+    const privateKey = randomPrivateKey();
+    const publicKey = privateKeyToPublic(privateKey);
+    const publicKeyHex = typeof publicKey === "string" ? publicKey : Buffer.from(publicKey).toString("hex");
+    const signature = signStructuredData({ ...buildAgentClaimClarity(prepared.claim), privateKey });
+    const otherWalletAddress = publicKeyToAddressSingleSig(privateKeyToPublic(randomPrivateKey()), "testnet");
+    await expect(service.completeAgentClaim({ claim_token: identity.claim_token,
+      user_code: identity.user_code, challenge_id: prepared.claim.challengeId,
+      wallet_address: otherWalletAddress, public_key: publicKeyHex, signature }))
+      .rejects.toMatchObject({ code: "invalid_wallet_signature" });
+
+    const walletAddress = publicKeyToAddressSingleSig(publicKey, "testnet");
+    await service.completeAgentClaim({ claim_token: identity.claim_token, user_code: identity.user_code,
+      challenge_id: prepared.claim.challengeId, wallet_address: walletAddress,
+      public_key: publicKeyHex, signature });
+    await expect(service.completeAgentClaim({ claim_token: identity.claim_token, user_code: identity.user_code,
+      challenge_id: prepared.claim.challengeId, wallet_address: walletAddress,
+      public_key: publicKeyHex, signature }))
+      .rejects.toMatchObject({ code: "invalid_grant" });
   });
 });

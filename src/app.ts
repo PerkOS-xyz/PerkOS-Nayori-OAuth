@@ -141,6 +141,82 @@ export function createApp(options: {
     }
   });
 
+  if (config.agentRegistrationEnabled) {
+    app.post("/agent/identity", async (context) => {
+      if (!registrationLimiter.consume(clientKey(context.req.raw.headers), now())) {
+        context.header("retry-after", "60");
+        return context.json({ error: "rate_limited", message: "Rate limit exceeded.",
+          request_id: context.get("requestId") }, 429);
+      }
+      try {
+        const input = JSON.parse(await readBody(context.req.raw, MAX_JSON_BYTES)) as unknown;
+        const identity = await oauth.createAgentIdentity(input);
+        logger.info({ event: "agent_identity_registered", requestId: context.get("requestId"),
+          registrationId: identity.registration_id });
+        return context.json(identity, 201);
+      } catch (error) {
+        if (!(error instanceof OAuthServiceError)) {
+          return context.json({ error: "invalid_request", message: "The identity request must be valid JSON.",
+            request_id: context.get("requestId") }, 400);
+        }
+        return context.json({ error: error.code, message: error.publicMessage,
+          request_id: context.get("requestId") }, error.status);
+      }
+    });
+
+    app.post("/agent/identity/claim", async (context) => {
+      if (!registrationLimiter.consume(clientKey(context.req.raw.headers), now())) {
+        context.header("retry-after", "60");
+        return context.json({ error: "rate_limited", message: "Rate limit exceeded.",
+          request_id: context.get("requestId") }, 429);
+      }
+      try {
+        const input = JSON.parse(await readBody(context.req.raw, MAX_JSON_BYTES)) as unknown;
+        return context.json(await oauth.prepareAgentClaim(input));
+      } catch (error) {
+        if (!(error instanceof OAuthServiceError)) {
+          return context.json({ error: "invalid_request", message: "The claim request must be valid JSON.",
+            request_id: context.get("requestId") }, 400);
+        }
+        return context.json({ error: error.code, message: error.publicMessage,
+          request_id: context.get("requestId") }, error.status);
+      }
+    });
+
+    app.post("/agent/identity/claim/complete", async (context) => {
+      if (!registrationLimiter.consume(clientKey(context.req.raw.headers), now())) {
+        context.header("retry-after", "60");
+        return context.json({ error: "rate_limited", message: "Rate limit exceeded.",
+          request_id: context.get("requestId") }, 429);
+      }
+      try {
+        const input = JSON.parse(await readBody(context.req.raw, MAX_JSON_BYTES)) as unknown;
+        const result = await oauth.completeAgentClaim(input);
+        logger.info({ event: "agent_identity_claimed", requestId: context.get("requestId"),
+          registrationId: result.registration_id });
+        return context.json(result);
+      } catch (error) {
+        if (!(error instanceof OAuthServiceError)) {
+          return context.json({ error: "invalid_request", message: "The signed claim request must be valid JSON.",
+            request_id: context.get("requestId") }, 400);
+        }
+        if (error.status === 401) context.header("www-authenticate", 'Signature realm="nayori-agent-claim"');
+        return context.json({ error: error.code, message: error.publicMessage,
+          request_id: context.get("requestId") }, error.status);
+      }
+    });
+
+    app.get("/v1/agent-registrations/self", async (context) => {
+      try {
+        return context.json(await oauth.getAgentSelf(context.req.header("authorization")));
+      } catch (error) {
+        if (!(error instanceof OAuthServiceError)) throw error;
+        context.header("www-authenticate", 'Bearer realm="nayori-agent-self", scope="agent:self"');
+        return context.json(oauthError(error, context.get("requestId")), error.status);
+      }
+    });
+  }
+
   if (config.partnerRegistrationEnabled) {
     app.post("/v1/partners/challenges", async (context) => {
       if (!registrationLimiter.consume(clientKey(context.req.raw.headers), now())) {

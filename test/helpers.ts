@@ -1,6 +1,7 @@
 import { exportJWK, generateKeyPair } from "jose";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import type {
+  AgentRegistrationRecord,
   OAuthClientRecord,
   OAuthStore,
   PartnerInvitationRecord,
@@ -13,6 +14,8 @@ export class MemoryStore implements OAuthStore {
   client: OAuthClientRecord | null = null;
   tokenIssuedAt: Date | null = null;
   ready = true;
+  agent: (AgentRegistrationRecord & { claimTokenDigest: string; userCodeDigest: string }) | null = null;
+  agentTokenIssuedAt: Date | null = null;
 
   async ping(): Promise<void> { if (!this.ready) throw new Error("not ready"); }
   async close(): Promise<void> {}
@@ -41,6 +44,42 @@ export class MemoryStore implements OAuthStore {
   }
   async findActiveOAuthClient(clientId: string) { return this.client?.clientId === clientId ? this.client : null; }
   async recordOAuthTokenIssued(_clientId: string, issuedAt: Date): Promise<void> { this.tokenIssuedAt = issuedAt; }
+  async insertAgentRegistration(input: AgentRegistrationRecord & {
+    claimTokenDigest: string; userCodeDigest: string;
+  }): Promise<void> { this.agent = input; }
+  async findAgentRegistration(registrationId: string) {
+    return this.agent?.registrationId === registrationId ? this.agent : null;
+  }
+  async findAgentRegistrationForClaim(input: {
+    claimTokenDigest: string; userCodeDigest: string; now: Date;
+  }) {
+    return this.agent && this.agent.claimTokenDigest === input.claimTokenDigest &&
+      this.agent.userCodeDigest === input.userCodeDigest && this.agent.claimExpiresAt >= input.now &&
+      !this.agent.revokedAt ? this.agent : null;
+  }
+  async claimAgentRegistration(input: {
+    challengeId: string; walletAddress: string; publicKey: string; claimedAt: Date;
+  }) {
+    if (!this.agent || this.agent.challengeId !== input.challengeId || this.agent.claimedAt ||
+        this.agent.revokedAt || this.agent.claimExpiresAt < input.claimedAt) return null;
+    this.agent = { ...this.agent, claimedAt: input.claimedAt,
+      walletAddress: input.walletAddress, publicKey: input.publicKey };
+    return this.agent;
+  }
+  async pollAgentClaim(input: {
+    claimTokenDigest: string; now: Date; minimumIntervalSeconds: number;
+  }) {
+    if (!this.agent || this.agent.claimTokenDigest !== input.claimTokenDigest || this.agent.revokedAt ||
+        this.agent.claimExpiresAt < input.now) return { status: "expired" as const, registration: this.agent };
+    if (this.agent.lastPolledAt && input.now.getTime() - this.agent.lastPolledAt.getTime() <
+        input.minimumIntervalSeconds * 1_000) return { status: "slow_down" as const, registration: this.agent };
+    this.agent = { ...this.agent, lastPolledAt: input.now };
+    return { status: this.agent.claimedAt ? "claimed" as const : "pending" as const,
+      registration: this.agent };
+  }
+  async recordAgentAccessTokenIssued(_registrationId: string, issuedAt: Date): Promise<void> {
+    this.agentTokenIssuedAt = issuedAt;
+  }
 }
 
 export async function testConfig(overrides: NodeJS.ProcessEnv = {}): Promise<AppConfig> {
@@ -54,6 +93,7 @@ export async function testConfig(overrides: NodeJS.ProcessEnv = {}): Promise<App
     API_ORIGIN: "https://api.nayori.ai",
     STACKS_NETWORK: "testnet",
     PARTNER_REGISTRATION_ENABLED: "true",
+    AGENT_REGISTRATION_ENABLED: "true",
     OAUTH_SIGNING_PRIVATE_JWK_JSON: JSON.stringify(key),
     OAUTH_ACCESS_TOKEN_TTL_SECONDS: "120",
     ...overrides

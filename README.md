@@ -10,9 +10,10 @@ Private OAuth authorization service for [Nayori](https://nayori.ai), built by Pe
 | OAuth authorization-server issuer | `https://oauth.nayori.ai` |
 | API, MCP and x402 resource server | `https://api.nayori.ai` |
 
-This service owns invitation, wallet challenge and OAuth-client state in a dedicated PostgreSQL
-database. It issues short-lived EdDSA access tokens. It never receives a wallet private key and an
-OAuth token cannot sign, approve or sponsor a Stacks transaction.
+This service owns anonymous agent registrations, wallet claims, invitations and OAuth-client state
+in a dedicated PostgreSQL database. It issues short-lived EdDSA assertions and access tokens. It
+never receives a wallet private key and an OAuth token cannot sign, approve or sponsor a Stacks
+transaction.
 
 ## Implemented endpoints
 
@@ -26,11 +27,27 @@ OAuth token cannot sign, approve or sponsor a Stacks transaction.
 | `GET /oauth/jwks.json` | Public access-token verification keys |
 | `GET /auth.md` | Agent-readable registration and authorization contract |
 | `POST /oauth/token` | `client_credentials` with `client_secret_basic` |
+| `POST /agent/identity` | Anonymous agent registration and short-lived identity assertion |
+| `POST /agent/identity/claim` | Validate a claim token plus separate user code and return SIP-018 data |
+| `POST /agent/identity/claim/complete` | Atomically bind a Leather signature and Stacks wallet |
+| `GET /v1/agent-registrations/self` | Read the current `agent:self` registration |
 | `POST /v1/partners/challenges` | Invitation-bound Stacks wallet challenge |
 | `POST /v1/partners/register` | Atomic challenge consumption and one-time credentials |
 
-Registration routes and their `agent_auth` metadata are absent while
-`PARTNER_REGISTRATION_ENABLED=false`.
+Anonymous routes and `agent_auth` metadata are absent while `AGENT_REGISTRATION_ENABLED=false`.
+Invite-only merchant routes are independently absent while `PARTNER_REGISTRATION_ENABLED=false`.
+
+## Anonymous agent boundary
+
+`POST /agent/identity` requires no invitation and returns an assertion, opaque claim token, separate
+user code and claim link. The link carries the token in its URL fragment so it is not sent in the
+initial HTTP request. The owner signs a SIP-018 structured message in Leather; the service derives
+the Stacks address from the public key and consumes the claim atomically.
+
+Both unclaimed and claimed agents receive exactly `agent:self`. The claim adds accountable wallet
+ownership only. It cannot create a merchant, request commerce scopes, settle a payment, invoke the
+partner MCP surface or act as a partner invitation. Claim and assertion grants have no refresh
+tokens and expire according to `.env`.
 
 ## Local verification
 
@@ -76,4 +93,5 @@ Images are built on the PerkOS VPS from an exact merged commit. Caddy, Compose, 
 signing material and runtime `.env` files remain outside GitHub. Deploy `oauth.nayori.ai` before
 switching Platform or apex discovery to the external issuer.
 
-See [the approved separation design](docs/plans/2026-08-27-nayori-oauth-separation-design.md).
+See [the approved separation design](docs/plans/2026-08-27-nayori-oauth-separation-design.md) and
+[the anonymous claim design](docs/plans/2026-08-28-anonymous-wallet-claim-design.md).
