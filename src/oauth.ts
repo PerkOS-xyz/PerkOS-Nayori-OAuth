@@ -1,10 +1,11 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { verifyMessageSignatureRsv } from "@stacks/encryption";
-import { publicKeyToAddressSingleSig } from "@stacks/transactions";
-import { SignJWT, importJWK, type JWK } from "jose";
+import { Cl, encodeStructuredDataBytes, publicKeyToAddressSingleSig } from "@stacks/transactions";
+import { SignJWT, createLocalJWKSet, importJWK, jwtVerify, type JWK, type JWTPayload } from "jose";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
-import { oauthScopes, type OAuthClientRecord, type OAuthScope, type OAuthStore, type PartnerInvitationRecord } from "./store.js";
+import { agentScopes, oauthScopes, type AgentRegistrationRecord, type OAuthClientRecord,
+  type OAuthScope, type OAuthStore, type PartnerInvitationRecord } from "./store.js";
 
 const invitationTokenPattern = /^ny_pi_[A-Za-z0-9_-]{43}$/;
 const clientIdPattern = /^ny_oc_[A-Za-z0-9_-]{24}$/;
@@ -12,6 +13,10 @@ const clientSecretPattern = /^ny_cs_[A-Za-z0-9_-]{43}$/;
 const challengeIdPattern = /^nc_[0-9a-f]{32}$/;
 const publicKeyPattern = /^(?:0x)?(02|03)[0-9a-f]{64}$/i;
 const signaturePattern = /^(?:0x)?[0-9a-f]{130}$/i;
+const agentRegistrationIdPattern = /^ny_ar_[A-Za-z0-9_-]{24}$/;
+const agentClaimTokenPattern = /^ny_ct_[A-Za-z0-9_-]{43}$/;
+const agentChallengeIdPattern = /^ny_ac_[0-9a-f]{32}$/;
+const userCodePattern = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/;
 const base64Url = z.string().regex(/^[A-Za-z0-9_-]+$/);
 
 const challengeRequest = z.object({
@@ -22,6 +27,20 @@ const registrationRequest = z.object({
   challengeId: z.string().regex(challengeIdPattern),
   signature: z.string().regex(signaturePattern),
   publicKey: z.string().regex(publicKeyPattern)
+}).strict();
+const agentIdentityRequest = z.object({
+  type: z.literal("anonymous"),
+  label: z.string().trim().min(1).max(80).optional()
+}).strict();
+const agentClaimRequest = z.object({
+  claim_token: z.string().regex(agentClaimTokenPattern),
+  user_code: z.string().trim().toUpperCase().regex(userCodePattern)
+}).strict();
+const agentClaimCompletionRequest = agentClaimRequest.extend({
+  challenge_id: z.string().regex(agentChallengeIdPattern),
+  wallet_address: z.string().min(38).max(64),
+  signature: z.string().regex(signaturePattern),
+  public_key: z.string().regex(publicKeyPattern)
 }).strict();
 const privateJwk = z.object({
   kty: z.literal("OKP"), crv: z.literal("Ed25519"), x: base64Url, d: base64Url,
@@ -36,7 +55,8 @@ const publicJwks = z.object({ keys: z.array(publicJwk).max(16) }).strict();
 export class OAuthServiceError extends Error {
   constructor(
     readonly code: "invalid_request" | "invalid_invitation" | "invalid_challenge" |
-      "invalid_wallet_signature" | "invalid_client" | "invalid_scope",
+      "invalid_wallet_signature" | "invalid_client" | "invalid_scope" | "invalid_grant" |
+      "authorization_pending" | "slow_down" | "expired_token" | "invalid_token",
     readonly publicMessage: string,
     readonly status: 400 | 401 | 409
   ) { super(publicMessage); this.name = "OAuthServiceError"; }
@@ -50,6 +70,18 @@ export type OAuthSigner = {
     readonly issuedAt: number;
     readonly expiresAt: number;
   }): Promise<string>;
+  signAgentAssertion(input: {
+    readonly registration: AgentRegistrationRecord;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+  }): Promise<string>;
+  signAgentAccessToken(input: {
+    readonly registration: AgentRegistrationRecord;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+  }): Promise<string>;
+  verifyAgentAssertion(token: string, now: Date): Promise<JWTPayload>;
+  verifyAgentAccessToken(token: string, now: Date): Promise<JWTPayload>;
 };
 
 function parseJson(value: string, name: string): unknown {
@@ -62,8 +94,10 @@ export async function createOAuthSigner(config: AppConfig): Promise<OAuthSigner>
   const previous = publicJwks.parse(parseJson(config.oauthPreviousPublicJwksJson, "OAUTH_PREVIOUS_PUBLIC_JWKS_JSON"));
   const current: JWK = { kty: "OKP", crv: "Ed25519", x: key.x, kid: key.kid, alg: "EdDSA", use: "sig" };
   const signingKey = await importJWK(key as JWK, "EdDSA");
+  const publicKeys = { keys: [current, ...previous.keys.map((item) => ({ ...item, alg: "EdDSA", use: "sig" }))] };
+  const verificationKeySet = createLocalJWKSet(publicKeys);
   return {
-    publicJwks: { keys: [current, ...previous.keys.map((item) => ({ ...item, alg: "EdDSA", use: "sig" }))] },
+    publicJwks: publicKeys,
     async sign(input) {
       return new SignJWT({
         client_id: input.client.clientId,
@@ -78,6 +112,59 @@ export async function createOAuthSigner(config: AppConfig): Promise<OAuthSigner>
         .setIssuedAt(input.issuedAt)
         .setExpirationTime(input.expiresAt)
         .sign(signingKey);
+    },
+    async signAgentAssertion(input) {
+      return new SignJWT({
+        token_kind: "identity_assertion",
+        registration_id: input.registration.registrationId,
+        claimed: Boolean(input.registration.claimedAt),
+        wallet_address: input.registration.walletAddress ?? undefined,
+        scope: agentScopes.join(" ")
+      })
+        .setProtectedHeader({ alg: "EdDSA", kid: key.kid, typ: "nayori-agent-assertion+jwt" })
+        .setIssuer(config.issuerOrigin)
+        .setAudience(`${config.issuerOrigin}/oauth/token`)
+        .setSubject(`agent:${input.registration.registrationId}`)
+        .setJti(randomUUID())
+        .setIssuedAt(input.issuedAt)
+        .setExpirationTime(input.expiresAt)
+        .sign(signingKey);
+    },
+    async signAgentAccessToken(input) {
+      return new SignJWT({
+        token_kind: "agent_access_token",
+        principal_type: "agent",
+        registration_id: input.registration.registrationId,
+        claimed: Boolean(input.registration.claimedAt),
+        wallet_address: input.registration.walletAddress ?? undefined,
+        scope: agentScopes.join(" ")
+      })
+        .setProtectedHeader({ alg: "EdDSA", kid: key.kid, typ: "at+jwt" })
+        .setIssuer(config.issuerOrigin)
+        .setAudience(config.resourceOrigin)
+        .setSubject(`agent:${input.registration.registrationId}`)
+        .setJti(randomUUID())
+        .setIssuedAt(input.issuedAt)
+        .setExpirationTime(input.expiresAt)
+        .sign(signingKey);
+    },
+    async verifyAgentAssertion(token, currentDate) {
+      const verified = await jwtVerify(token, verificationKeySet, {
+        algorithms: ["EdDSA"], issuer: config.issuerOrigin,
+        audience: `${config.issuerOrigin}/oauth/token`, currentDate
+      });
+      if (verified.protectedHeader.typ !== "nayori-agent-assertion+jwt" ||
+          verified.payload.token_kind !== "identity_assertion") throw new Error("invalid assertion type");
+      return verified.payload;
+    },
+    async verifyAgentAccessToken(token, currentDate) {
+      const verified = await jwtVerify(token, verificationKeySet, {
+        algorithms: ["EdDSA"], issuer: config.issuerOrigin,
+        audience: config.resourceOrigin, currentDate
+      });
+      if (verified.protectedHeader.typ !== "at+jwt" ||
+          verified.payload.token_kind !== "agent_access_token") throw new Error("invalid access token type");
+      return verified.payload;
     }
   };
 }
@@ -87,6 +174,61 @@ function normalizeHex(value: string): string { return /^0x/i.test(value) ? value
 function safeDigestEqual(left: string, right: string): boolean {
   return /^[0-9a-f]{64}$/.test(left) && /^[0-9a-f]{64}$/.test(right) &&
     timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+}
+
+function claimCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = randomBytes(8);
+  const value = Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+  return `${value.slice(0, 4)}-${value.slice(4)}`;
+}
+
+export type AgentClaimPayload = {
+  readonly registrationId: string;
+  readonly challengeId: string;
+  readonly userCode: string;
+  readonly expiresAt: string;
+  readonly network: "testnet" | "mainnet";
+  readonly domain: { readonly name: "Nayori Agent Claim"; readonly version: "1"; readonly chainId: number };
+  readonly message: { readonly action: "claim-agent"; readonly origin: string;
+    readonly registrationId: string; readonly challengeId: string; readonly userCode: string;
+    readonly expiresAt: number };
+};
+
+function createAgentClaimPayload(config: AppConfig, registration: AgentRegistrationRecord, userCode: string): AgentClaimPayload {
+  const expiresAt = Math.floor(registration.claimExpiresAt.getTime() / 1_000);
+  return {
+    registrationId: registration.registrationId,
+    challengeId: registration.challengeId,
+    userCode,
+    expiresAt: registration.claimExpiresAt.toISOString(),
+    network: config.stacksNetwork,
+    domain: { name: "Nayori Agent Claim", version: "1",
+      chainId: config.stacksNetwork === "mainnet" ? 1 : 2_147_483_648 },
+    message: { action: "claim-agent", origin: config.issuerOrigin,
+      registrationId: registration.registrationId, challengeId: registration.challengeId,
+      userCode, expiresAt }
+  };
+}
+
+export function buildAgentClaimClarity(payload: AgentClaimPayload) {
+  return {
+    domain: Cl.tuple({ name: Cl.stringAscii(payload.domain.name),
+      version: Cl.stringAscii(payload.domain.version), "chain-id": Cl.uint(payload.domain.chainId) }),
+    message: Cl.tuple({ action: Cl.stringAscii(payload.message.action),
+      origin: Cl.stringAscii(payload.message.origin),
+      "registration-id": Cl.stringAscii(payload.message.registrationId),
+      "challenge-id": Cl.stringAscii(payload.message.challengeId),
+      "user-code": Cl.stringAscii(payload.message.userCode),
+      "expires-at": Cl.uint(payload.message.expiresAt) })
+  };
+}
+
+function bearerToken(value: string | undefined): string {
+  if (!value?.startsWith("Bearer ") || value.length < 10) {
+    throw new OAuthServiceError("invalid_token", "Bearer authentication failed.", 401);
+  }
+  return value.slice(7);
 }
 
 function parseBasic(value: string | undefined): { clientId: string; secret: string } {
@@ -123,6 +265,21 @@ export type OAuthService = {
   }>;
   issueToken(authorization: string | undefined, form: URLSearchParams): Promise<{
     readonly access_token: string; readonly token_type: "Bearer"; readonly expires_in: number; readonly scope: string;
+    readonly identity_assertion?: string;
+  }>;
+  createAgentIdentity(input: unknown): Promise<{
+    readonly registration_id: string; readonly identity_assertion: string; readonly assertion_expires: string;
+    readonly pre_claim_scopes: readonly ["agent:self"]; readonly post_claim_scopes: readonly ["agent:self"];
+    readonly claim_token: string; readonly claim_url: string; readonly user_code: string;
+    readonly expires_at: string; readonly interval: number;
+  }>;
+  prepareAgentClaim(input: unknown): Promise<{ readonly status: "pending" | "claimed";
+    readonly claim: AgentClaimPayload; readonly wallet_address?: string }>;
+  completeAgentClaim(input: unknown): Promise<{ readonly status: "claimed";
+    readonly registration_id: string; readonly wallet_address: string; readonly scopes: readonly ["agent:self"] }>;
+  getAgentSelf(authorization: string | undefined): Promise<{
+    readonly registration_id: string; readonly label: string | null; readonly claimed: boolean;
+    readonly wallet_address: string | null; readonly scopes: readonly ["agent:self"];
   }>;
 };
 
@@ -131,6 +288,34 @@ export function createOAuthService(options: {
 }): OAuthService {
   const { config, store, signer } = options;
   const now = options.now ?? (() => Date.now());
+  async function agentRegistrationFromAssertion(assertion: string, current: Date) {
+    try {
+      const payload = await signer.verifyAgentAssertion(assertion, current);
+      const registrationId = typeof payload.registration_id === "string" ? payload.registration_id : "";
+      if (!agentRegistrationIdPattern.test(registrationId) || payload.sub !== `agent:${registrationId}`) throw new Error("invalid subject");
+      const registration = await store.findAgentRegistration(registrationId);
+      if (!registration || registration.revokedAt) throw new Error("inactive registration");
+      return registration;
+    } catch {
+      throw new OAuthServiceError("invalid_grant", "The identity assertion is invalid or expired.", 400);
+    }
+  }
+  async function issueAgentAccessToken(registration: AgentRegistrationRecord, current: Date, includeAssertion = false) {
+    const issuedAt = Math.floor(current.getTime() / 1_000);
+    const expiresAt = issuedAt + config.oauthAccessTokenTtlSeconds;
+    const token = await signer.signAgentAccessToken({ registration, issuedAt, expiresAt });
+    await store.recordAgentAccessTokenIssued(registration.registrationId, current);
+    const response: { access_token: string; token_type: "Bearer"; expires_in: number; scope: string;
+      identity_assertion?: string } = {
+      access_token: token, token_type: "Bearer", expires_in: config.oauthAccessTokenTtlSeconds,
+      scope: agentScopes.join(" ")
+    };
+    if (includeAssertion) {
+      response.identity_assertion = await signer.signAgentAssertion({ registration, issuedAt,
+        expiresAt: issuedAt + config.agentAssertionTtlSeconds });
+    }
+    return response;
+  }
   return {
     publicJwks: signer.publicJwks,
     async issueChallenge(input) {
@@ -180,8 +365,26 @@ export function createOAuthService(options: {
         scopes: client.scopes, walletAddress: client.walletAddress };
     },
     async issueToken(authorization, form) {
-      if (form.get("grant_type") !== "client_credentials") {
-        throw new OAuthServiceError("invalid_request", "Only client_credentials is supported.", 400);
+      const grantType = form.get("grant_type");
+      const current = new Date(now());
+      if (grantType === "urn:ietf:params:oauth:grant-type:jwt-bearer") {
+        const assertion = form.get("assertion") ?? "";
+        return issueAgentAccessToken(await agentRegistrationFromAssertion(assertion, current), current);
+      }
+      if (grantType === "urn:workos:agent-auth:grant-type:claim") {
+        const claimToken = form.get("claim_token") ?? "";
+        if (!agentClaimTokenPattern.test(claimToken)) {
+          throw new OAuthServiceError("invalid_grant", "The claim token is invalid.", 400);
+        }
+        const result = await store.pollAgentClaim({ claimTokenDigest: digest(claimToken), now: current,
+          minimumIntervalSeconds: config.agentClaimPollIntervalSeconds });
+        if (result.status === "pending") throw new OAuthServiceError("authorization_pending", "The wallet claim is still pending.", 400);
+        if (result.status === "slow_down") throw new OAuthServiceError("slow_down", "Poll no faster than the advertised interval.", 400);
+        if (result.status === "expired" || !result.registration) throw new OAuthServiceError("expired_token", "The claim token is invalid or expired.", 400);
+        return issueAgentAccessToken(result.registration, current, true);
+      }
+      if (grantType !== "client_credentials") {
+        throw new OAuthServiceError("invalid_request", "The OAuth grant type is not supported.", 400);
       }
       const credentials = parseBasic(authorization);
       const client = await store.findActiveOAuthClient(credentials.clientId);
@@ -189,12 +392,93 @@ export function createOAuthService(options: {
         throw new OAuthServiceError("invalid_client", "Client authentication failed.", 401);
       }
       const scopes = requestedScopes(form.get("scope") ?? undefined, client.scopes);
-      const issuedAt = Math.floor(now() / 1_000);
+      const issuedAt = Math.floor(current.getTime() / 1_000);
       const expiresAt = issuedAt + config.oauthAccessTokenTtlSeconds;
       const token = await signer.sign({ client, scopes, issuedAt, expiresAt });
       await store.recordOAuthTokenIssued(client.clientId, new Date(issuedAt * 1_000));
       return { access_token: token, token_type: "Bearer", expires_in: config.oauthAccessTokenTtlSeconds,
         scope: scopes.join(" ") };
+    },
+    async createAgentIdentity(input) {
+      const parsed = agentIdentityRequest.safeParse(input);
+      if (!parsed.success) throw new OAuthServiceError("invalid_request", "The anonymous identity request is invalid.", 400);
+      const current = new Date(now());
+      const registrationId = `ny_ar_${randomBytes(18).toString("base64url")}`;
+      const challengeId = `ny_ac_${randomBytes(16).toString("hex")}`;
+      const claimToken = `ny_ct_${randomBytes(32).toString("base64url")}`;
+      const userCode = claimCode();
+      const claimExpiresAt = new Date(current.getTime() + config.agentClaimTtlSeconds * 1_000);
+      const registration: AgentRegistrationRecord = { registrationId,
+        label: parsed.data.label ?? null, challengeId, claimExpiresAt, claimedAt: null,
+        walletAddress: null, publicKey: null, revokedAt: null, lastPolledAt: null };
+      await store.insertAgentRegistration({ ...registration, claimTokenDigest: digest(claimToken),
+        userCodeDigest: digest(userCode) });
+      const issuedAt = Math.floor(current.getTime() / 1_000);
+      const assertionExpiresAt = issuedAt + config.agentAssertionTtlSeconds;
+      return { registration_id: registrationId,
+        identity_assertion: await signer.signAgentAssertion({ registration, issuedAt, expiresAt: assertionExpiresAt }),
+        assertion_expires: new Date(assertionExpiresAt * 1_000).toISOString(),
+        pre_claim_scopes: agentScopes, post_claim_scopes: agentScopes,
+        claim_token: claimToken, claim_url: `${config.resourceOrigin}/agents/claim#${claimToken}`,
+        user_code: userCode, expires_at: claimExpiresAt.toISOString(),
+        interval: config.agentClaimPollIntervalSeconds };
+    },
+    async prepareAgentClaim(input) {
+      const parsed = agentClaimRequest.safeParse(input);
+      if (!parsed.success) throw new OAuthServiceError("invalid_request", "The claim request is invalid.", 400);
+      const registration = await store.findAgentRegistrationForClaim({
+        claimTokenDigest: digest(parsed.data.claim_token), userCodeDigest: digest(parsed.data.user_code),
+        now: new Date(now())
+      });
+      if (!registration) throw new OAuthServiceError("invalid_grant", "The claim token or user code is invalid or expired.", 400);
+      return { status: registration.claimedAt ? "claimed" : "pending",
+        claim: createAgentClaimPayload(config, registration, parsed.data.user_code),
+        ...(registration.walletAddress ? { wallet_address: registration.walletAddress } : {}) };
+    },
+    async completeAgentClaim(input) {
+      const parsed = agentClaimCompletionRequest.safeParse(input);
+      if (!parsed.success) throw new OAuthServiceError("invalid_request", "The signed claim request is invalid.", 400);
+      const current = new Date(now());
+      const registration = await store.findAgentRegistrationForClaim({
+        claimTokenDigest: digest(parsed.data.claim_token), userCodeDigest: digest(parsed.data.user_code), now: current
+      });
+      if (!registration || registration.challengeId !== parsed.data.challenge_id || registration.claimedAt) {
+        throw new OAuthServiceError("invalid_grant", "The wallet claim is invalid, expired or already completed.", 409);
+      }
+      let address = "";
+      let valid = false;
+      const publicKey = normalizeHex(parsed.data.public_key);
+      try {
+        address = publicKeyToAddressSingleSig(publicKey, config.stacksNetwork);
+        const clarity = buildAgentClaimClarity(createAgentClaimPayload(config, registration, parsed.data.user_code));
+        valid = verifyMessageSignatureRsv({ message: createHash("sha256").update(encodeStructuredDataBytes(clarity)).digest(),
+          publicKey, signature: normalizeHex(parsed.data.signature) });
+      } catch { /* normalized below */ }
+      if (!valid || address !== parsed.data.wallet_address) {
+        throw new OAuthServiceError("invalid_wallet_signature", "The SIP-018 signature does not authorize this agent claim.", 401);
+      }
+      const claimed = await store.claimAgentRegistration({ challengeId: registration.challengeId,
+        walletAddress: address, publicKey, claimedAt: current });
+      if (!claimed) throw new OAuthServiceError("invalid_grant", "The wallet claim is invalid, expired or already completed.", 409);
+      return { status: "claimed", registration_id: claimed.registrationId,
+        wallet_address: address, scopes: agentScopes };
+    },
+    async getAgentSelf(authorization) {
+      try {
+        const current = new Date(now());
+        const payload = await signer.verifyAgentAccessToken(bearerToken(authorization), current);
+        const registrationId = typeof payload.registration_id === "string" ? payload.registration_id : "";
+        if (!agentRegistrationIdPattern.test(registrationId) || payload.sub !== `agent:${registrationId}` ||
+            payload.scope !== "agent:self") throw new Error("invalid principal");
+        const registration = await store.findAgentRegistration(registrationId);
+        if (!registration || registration.revokedAt) throw new Error("inactive registration");
+        return { registration_id: registration.registrationId, label: registration.label,
+          claimed: Boolean(registration.claimedAt), wallet_address: registration.walletAddress,
+          scopes: agentScopes };
+      } catch (error) {
+        if (error instanceof OAuthServiceError) throw error;
+        throw new OAuthServiceError("invalid_token", "Bearer authentication failed.", 401);
+      }
     }
   };
 }

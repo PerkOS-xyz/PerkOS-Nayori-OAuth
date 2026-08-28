@@ -20,7 +20,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run lint && npm run typecheck && npm test && npm run build"
+    "verify:boot": "node -e \"import('./dist/app.js')\"",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run verify:boot"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",

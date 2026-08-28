@@ -29,6 +29,7 @@ services:
       DATABASE_URL: postgresql://nayori_oauth:nayori-local-only@postgres:5432/nayori_oauth
       ISSUER_ORIGIN: http://localhost:8080
       NODE_ENV: development
+      AGENT_REGISTRATION_ENABLED: "false"
       PARTNER_REGISTRATION_ENABLED: "false"
       RELEASE_SHA: local-compose
       RESOURCE_ORIGIN: https://nayori.ai
