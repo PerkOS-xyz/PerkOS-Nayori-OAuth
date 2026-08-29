@@ -17,9 +17,15 @@ type Variables = { requestId: string };
 const MAX_JSON_BYTES = 32_768;
 const MAX_FORM_BYTES = 8_192;
 const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+const SAFE_PROXY_ADDRESS = /^[0-9A-Fa-f:.]{1,64}$/;
 
 function clientKey(headers: Headers): string {
-  return headers.get("cf-connecting-ip") ?? headers.get("x-real-ip") ?? "unknown";
+  // The production Caddy boundary overwrites X-Real-IP with the socket peer. Never trust
+  // CF-Connecting-IP here: the origin also accepts direct HTTPS and a caller can supply it.
+  const proxyAddress = headers.get("x-real-ip")?.trim();
+  return proxyAddress && SAFE_PROXY_ADDRESS.test(proxyAddress)
+    ? proxyAddress
+    : "unknown";
 }
 
 async function readBody(request: Request, maximum: number): Promise<string> {
