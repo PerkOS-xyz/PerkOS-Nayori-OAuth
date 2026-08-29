@@ -90,6 +90,24 @@ describe("OAuth HTTP contract", () => {
     expect(token.headers.get("retry-after")).toBe("60");
   });
 
+  it("keys rate limits only from the proxy-overwritten address", async () => {
+    const config = await testConfig();
+    const keys: string[] = [];
+    const limiter: RateLimiter = { consume: (key) => { keys.push(key); return true; } };
+    const app = createApp({ config, store: new MemoryStore(), oauth, logger, tokenLimiter: limiter });
+    const request = (headers: Record<string, string>) => app.request("/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
+      body: "grant_type=client_credentials",
+    });
+
+    await request({ "x-real-ip": "203.0.113.8", "cf-connecting-ip": "198.51.100.10" });
+    await request({ "cf-connecting-ip": "198.51.100.11" });
+    await request({ "x-real-ip": "not-an-ip", "cf-connecting-ip": "198.51.100.12" });
+
+    expect(keys).toEqual(["203.0.113.8", "unknown", "unknown"]);
+  });
+
   it("allows configured browser origins and rejects unconfigured preflight origins", async () => {
     const config = await testConfig({ CORS_ALLOWED_ORIGINS: "https://nayori.ai" });
     const app = createApp({ config, store: new MemoryStore(), oauth, logger });
