@@ -95,3 +95,10 @@ switching Platform or apex discovery to the external issuer.
 
 See [the approved separation design](docs/plans/2026-08-27-nayori-oauth-separation-design.md) and
 [the anonymous claim design](docs/plans/2026-08-28-anonymous-wallet-claim-design.md).
+
+## QA promotion
+
+`main` is the canonical integration branch. The `Promote exact main commit to QA` workflow accepts
+only a full commit SHA already contained in `main`, requires a fast-forward from the current `qa`
+branch, reruns the complete verification and dependency audit, and then pushes that exact SHA to
+`qa` without force. QA deployments must identify both this commit and the resulting image digest.
