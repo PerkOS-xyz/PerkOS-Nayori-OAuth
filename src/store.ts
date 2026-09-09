@@ -4,10 +4,15 @@ export const oauthScopes = [
   "payments:verify",
   "payments:settle",
   "payments:read",
-  "mcp:invoke"
+  "mcp:invoke",
+  "evidence:read",
+  "evidence:write"
 ] as const;
 
 export type OAuthScope = (typeof oauthScopes)[number];
+export function enabledOAuthScopes(evidenceEnabled: boolean): readonly OAuthScope[] {
+  return oauthScopes.filter(scope => evidenceEnabled || !scope.startsWith("evidence:"));
+}
 
 export type PartnerInvitationRecord = {
   readonly invitationId: string;

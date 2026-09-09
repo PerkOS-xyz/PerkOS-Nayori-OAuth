@@ -392,6 +392,9 @@ export function createOAuthService(options: {
         throw new OAuthServiceError("invalid_client", "Client authentication failed.", 401);
       }
       const scopes = requestedScopes(form.get("scope") ?? undefined, client.scopes);
+      if (!config.privateEvidenceIdentityEnabled && scopes.some(scope => scope.startsWith("evidence:"))) {
+        throw new OAuthServiceError("invalid_scope", "The requested OAuth scope is not allowed.", 400);
+      }
       const issuedAt = Math.floor(current.getTime() / 1_000);
       const expiresAt = issuedAt + config.oauthAccessTokenTtlSeconds;
       const token = await signer.sign({ client, scopes, issuedAt, expiresAt });

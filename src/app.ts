@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { AppConfig } from "./config.js";
+import { createEvidenceIdentityCheck } from "./evidence-identity.js";
 import {
   SERVICE_NAME,
   createAuthMarkdown,
@@ -146,6 +147,29 @@ export function createApp(options: {
       return context.json(oauthError(error, context.get("requestId")), error.status);
     }
   });
+
+  if (config.privateEvidenceIdentityEnabled) {
+    const checkIdentity = createEvidenceIdentityCheck({ config, store, publicJwks: oauth.publicJwks, now });
+    app.post("/oauth/evidence/identity", async context => {
+      if (!tokenLimiter.consume(clientKey(context.req.raw.headers), now())) {
+        context.header("retry-after", "60");
+        return context.json({ error: "temporarily_unavailable" }, 429);
+      }
+      try {
+        // No body/query token transport; never wait for or buffer an untrusted body.
+        if (new URL(context.req.url).search) throw new Error("invalid_request");
+        if (context.req.raw.body) {
+          void context.req.raw.body.cancel().catch(() => undefined);
+          throw new Error("invalid_request");
+        }
+        return context.json(await checkIdentity(context.req.header("authorization"),
+          context.req.header("x-nayori-evidence-scope")));
+      } catch {
+        context.header("www-authenticate", 'Bearer realm="nayori-evidence-identity"');
+        return context.json({ error: "evidence_identity_denied" }, 401);
+      }
+    });
+  }
 
   if (config.agentRegistrationEnabled) {
     app.post("/agent/identity", async (context) => {
