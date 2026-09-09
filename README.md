@@ -1,5 +1,9 @@
 # PerkOS Nayori OAuth
 
+QA source: [private evidence identity](docs/PRIVATE_EVIDENCE_IDENTITY.md) adds explicitly granted
+evidence scopes and a current-client identity check, **disabled by default**. This does not enable
+private uploads, expand existing agent permissions, or activate a deployment.
+
 Private OAuth authorization service for [Nayori](https://nayori.ai), built by PerkOS.
 
 ## Security identities
