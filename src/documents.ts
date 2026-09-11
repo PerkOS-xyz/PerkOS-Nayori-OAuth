@@ -1,5 +1,5 @@
 import type { AppConfig } from "./config.js";
-import { agentScopes, oauthScopes } from "./store.js";
+import { agentScopes, enabledOAuthScopes } from "./store.js";
 
 export const SERVICE_NAME = "nayori-oauth";
 export const SERVICE_VERSION = "0.1.0";
@@ -20,7 +20,7 @@ export function createSupportedDocument(config: AppConfig) {
       "urn:workos:agent-auth:grant-type:claim"
     ] : [])],
     tokenEndpointAuthMethods: ["client_secret_basic", ...(config.agentRegistrationEnabled ? ["none"] : [])],
-    scopes: [...oauthScopes, ...(config.agentRegistrationEnabled ? agentScopes : [])],
+    scopes: [...enabledOAuthScopes(config.privateEvidenceIdentityEnabled), ...(config.agentRegistrationEnabled ? agentScopes : [])],
     custody: "OAuth never requests a private key and cannot sign a Stacks payment."
   } as const;
 }
@@ -35,7 +35,7 @@ export function createAuthorizationServerMetadata(config: AppConfig) {
     grant_types_supported: ["client_credentials", ...(config.agentRegistrationEnabled ? agentGrantTypes : [])],
     response_types_supported: [],
     token_endpoint_auth_methods_supported: ["client_secret_basic", ...(config.agentRegistrationEnabled ? ["none"] : [])],
-    scopes_supported: [...oauthScopes, ...(config.agentRegistrationEnabled ? agentScopes : [])],
+    scopes_supported: [...enabledOAuthScopes(config.privateEvidenceIdentityEnabled), ...(config.agentRegistrationEnabled ? agentScopes : [])],
     service_documentation: `${config.resourceOrigin}/auth.md`,
     ...(config.agentRegistrationEnabled ? {
       agent_auth: {
@@ -60,7 +60,7 @@ export function createProtectedResourceMetadata(config: AppConfig) {
   return {
     resource: config.resourceOrigin,
     authorization_servers: [config.issuerOrigin],
-    scopes_supported: [...oauthScopes, ...(config.agentRegistrationEnabled ? agentScopes : [])],
+    scopes_supported: [...enabledOAuthScopes(config.privateEvidenceIdentityEnabled), ...(config.agentRegistrationEnabled ? agentScopes : [])],
     bearer_methods_supported: ["header"],
     resource_documentation: `${config.resourceOrigin}/auth.md`
   } as const;
@@ -140,6 +140,6 @@ payment. Each payment remains a separate transaction reviewed and signed by the 
 
 Tokens have audience ${config.resourceOrigin}, use EdDSA and expire in no more than 15 minutes.
 Automatic agent scope: ${agentScopes.join(", ")}. Invite-only partner scopes:
-${oauthScopes.join(", ")}.
+${enabledOAuthScopes(config.privateEvidenceIdentityEnabled).join(", ")}.
 `;
 }

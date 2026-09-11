@@ -43,6 +43,7 @@ const schema = z.object({
   STACKS_NETWORK: z.enum(["testnet", "mainnet"]).default("testnet"),
   PARTNER_REGISTRATION_ENABLED: flag,
   AGENT_REGISTRATION_ENABLED: flag,
+  PRIVATE_EVIDENCE_IDENTITY_ENABLED: flag,
   PARTNER_CHALLENGE_TTL_SECONDS: z.coerce.number().int().min(60).max(600).default(300),
   AGENT_CLAIM_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400).default(1800),
   AGENT_ASSERTION_TTL_SECONDS: z.coerce.number().int().min(60).max(900).default(300),
@@ -91,6 +92,7 @@ export type AppConfig = {
   readonly stacksNetwork: "testnet" | "mainnet";
   readonly partnerRegistrationEnabled: boolean;
   readonly agentRegistrationEnabled: boolean;
+  readonly privateEvidenceIdentityEnabled: boolean;
   readonly partnerChallengeTtlSeconds: number;
   readonly agentClaimTtlSeconds: number;
   readonly agentAssertionTtlSeconds: number;
@@ -122,6 +124,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     stacksNetwork: value.STACKS_NETWORK,
     partnerRegistrationEnabled: value.PARTNER_REGISTRATION_ENABLED,
     agentRegistrationEnabled: value.AGENT_REGISTRATION_ENABLED,
+    privateEvidenceIdentityEnabled: value.PRIVATE_EVIDENCE_IDENTITY_ENABLED,
     partnerChallengeTtlSeconds: value.PARTNER_CHALLENGE_TTL_SECONDS,
     agentClaimTtlSeconds: value.AGENT_CLAIM_TTL_SECONDS,
     agentAssertionTtlSeconds: value.AGENT_ASSERTION_TTL_SECONDS,
