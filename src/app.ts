@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { AppConfig } from "./config.js";
 import { createEvidenceIdentityCheck } from "./evidence-identity.js";
+import { requireEmptyRequestBody } from "./empty-request-body.js";
 import {
   SERVICE_NAME,
   createAuthMarkdown,
@@ -156,12 +157,9 @@ export function createApp(options: {
         return context.json({ error: "temporarily_unavailable" }, 429);
       }
       try {
-        // No body/query token transport; never wait for or buffer an untrusted body.
+        // No body/query token transport. Node may represent an empty POST as a stream.
         if (new URL(context.req.url).search) throw new Error("invalid_request");
-        if (context.req.raw.body) {
-          void context.req.raw.body.cancel().catch(() => undefined);
-          throw new Error("invalid_request");
-        }
+        await requireEmptyRequestBody(context.req.raw);
         return context.json(await checkIdentity(context.req.header("authorization"),
           context.req.header("x-nayori-evidence-scope")));
       } catch {

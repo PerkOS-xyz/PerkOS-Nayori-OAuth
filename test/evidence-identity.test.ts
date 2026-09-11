@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { serve } from "@hono/node-server";
+import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import { SignJWT, importJWK } from "jose";
 import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
@@ -24,6 +27,18 @@ async function fixture(enabled = true) {
   return { config, signer, store, service, basic, token, app, check, logger, headers };
 }
 describe("private evidence identity and explicit grants", () => {
+  it("accepts a genuinely empty POST through the Node HTTP adapter, not a nonempty body", async () => {
+    const f = await fixture();
+    const server = serve({ fetch: f.app.fetch, hostname: "127.0.0.1", port: 0 });
+    try {
+      if (!server.listening) await once(server, "listening");
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/oauth/evidence/identity`;
+      const empty = await fetch(url, { method: "POST", headers: f.headers });
+      expect(empty.status).toBe(200); await empty.body?.cancel();
+      const body = await fetch(url, { method: "POST", headers: f.headers, body: "x" });
+      expect(body.status).toBe(401); await body.body?.cancel();
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+  });
   it("issues only an explicitly granted scope and checks current identity", async () => {
     const f = await fixture();
     const response = await f.service.issueToken(f.basic, new URLSearchParams({ grant_type: "client_credentials", scope: "evidence:read" }));
