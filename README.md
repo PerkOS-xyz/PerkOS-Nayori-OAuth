@@ -4,6 +4,13 @@ QA source: [private evidence identity](docs/PRIVATE_EVIDENCE_IDENTITY.md) adds e
 evidence scopes and a current-client identity check, **disabled by default**. This does not enable
 private uploads, expand existing agent permissions, or activate a deployment.
 
+Production uses the same fail-closed identity boundary with
+`PRIVATE_EVIDENCE_IDENTITY_ENABLED=true`, but only after Platform is deployed with its exact
+mainnet private-evidence tuple. The managed Evaluator receives a dedicated OAuth client bound to
+its reviewed mainnet wallet and exactly `evidence:read`; its one-time secret is stored only in the
+Evaluator mode-600 secret file. See the
+[production activation runbook](docs/plans/2026-09-23-production-private-evidence-identity-runbook.md).
+
 Private OAuth authorization service for [Nayori](https://nayori.ai), built by PerkOS.
 
 ## Security identities
